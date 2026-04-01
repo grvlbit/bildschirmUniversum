@@ -1,0 +1,29 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build and release macOS binary
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile
+        run: swiftc -O -o bildschirmuniversum bildschirmuniversum.swift
+
+      - name: Archive binary
+        run: zip bildschirmuniversum-macos.zip bildschirmuniversum
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: bildschirmuniversum-macos.zip
+          generate_release_notes: true

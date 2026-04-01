@@ -1,3 +1,10 @@
+# Compiled Swift binary (produced by install.sh)
+bildschirmuniversum
+
+# Swift Package Manager
+.build/
+*.resolved
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

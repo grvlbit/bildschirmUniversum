@@ -1,0 +1,344 @@
+#!/usr/bin/env swift
+// bildschirmuniversum — align and position built-in + external monitors and set refresh rate to 60 Hz
+
+import CoreGraphics
+import Foundation
+
+// MARK: - Helpers
+
+func printError(_ msg: String) { fputs("error: \(msg)\n", stderr) }
+func printWarn(_ msg: String)  { fputs("warning: \(msg)\n", stderr) }
+
+// MARK: - Display model
+
+struct DisplayInfo {
+    let id: CGDirectDisplayID
+    let bounds: CGRect
+    let refreshRate: Double     // Hz reported by the active mode (0 = unknown)
+
+    var x:      Int32 { Int32(bounds.origin.x) }
+    var y:      Int32 { Int32(bounds.origin.y) }
+    var width:  Int32 { Int32(bounds.width)    }
+    var height: Int32 { Int32(bounds.height)   }
+
+    var rateLabel: String {
+        refreshRate > 0 ? String(format: " @ %.0f Hz", refreshRate) : ""
+    }
+
+    var label: String {
+        "id=\(id)  origin=(\(x), \(y))  "
+        + "size=\(Int(bounds.width))×\(Int(bounds.height))\(rateLabel)"
+    }
+}
+
+// MARK: - Alignment
+
+enum Alignment: String {
+    case top, center, bottom
+
+    /// Y origin for a display of `height` within a space of `maxHeight`,
+    /// anchored at `baseY` (the topmost edge of the display group).
+    func yOrigin(displayHeight: Int, maxHeight: Int, baseY: Int) -> Int32 {
+        let offset: Int
+        switch self {
+        case .top:    offset = 0
+        case .center: offset = (maxHeight - displayHeight) / 2
+        case .bottom: offset = maxHeight - displayHeight
+        }
+        return Int32(baseY + offset)
+    }
+}
+
+// MARK: - Built-in display position
+
+enum BuiltinPosition: String {
+    case bottom, left, right
+
+    /// New origin for the built-in display relative to the final external group.
+    ///
+    /// - `bottom`  → centered horizontally below the external group
+    /// - `left`    → flush-left of the external group, bottom-aligned
+    /// - `right`   → flush-right of the external group, bottom-aligned
+    func origin(builtin: DisplayInfo,
+                externalLeft: Int32, externalBottom: Int32,
+                externalTotalWidth: Int32) -> (x: Int32, y: Int32) {
+        switch self {
+        case .bottom:
+            let x = externalLeft + (externalTotalWidth - builtin.width) / 2
+            return (x, externalBottom)
+        case .left:
+            return (externalLeft - builtin.width, externalBottom - builtin.height)
+        case .right:
+            return (externalLeft + externalTotalWidth, externalBottom - builtin.height)
+        }
+    }
+}
+
+// MARK: - Refresh rate
+
+let targetHz = 60.0
+
+enum RefreshOutcome {
+    case alreadyAtTarget                // no mode change needed
+    case found(CGDisplayMode)           // switch to this mode
+    case notAvailable(current: Double)  // no 60 Hz mode at this resolution
+    case unknownRate                    // display reports 0 Hz (skip silently)
+}
+
+/// Finds the best 60 Hz `CGDisplayMode` for `displayID` that matches the
+/// current logical + pixel resolution and is usable as a desktop mode.
+func findRefreshMode(for displayID: CGDirectDisplayID) -> RefreshOutcome {
+    guard let current = CGDisplayCopyDisplayMode(displayID) else { return .unknownRate }
+    let currentRate = current.refreshRate
+    guard currentRate > 0 else { return .unknownRate }
+    guard abs(currentRate - targetHz) > 0.5 else { return .alreadyAtTarget }
+
+    // Match logical size AND pixel size so HiDPI scaling is preserved.
+    let lw = current.width;       let lh = current.height
+    let pw = current.pixelWidth;  let ph = current.pixelHeight
+
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+    guard let cf = CGDisplayCopyAllDisplayModes(displayID, opts),
+          let modes = cf as? [CGDisplayMode] else { return .unknownRate }
+
+    let candidate = modes.first { m in
+        m.width       == lw && m.height      == lh &&
+        m.pixelWidth  == pw && m.pixelHeight == ph &&
+        abs(m.refreshRate - targetHz) < 0.5 &&
+        m.isUsableForDesktopGUI()
+    }
+
+    if let mode = candidate { return .found(mode) }
+    return .notAvailable(current: currentRate)
+}
+
+// MARK: - Argument parsing
+
+let args = CommandLine.arguments
+var dryRun      = false
+var noAlign     = false
+var noRefresh   = false
+var alignment   = Alignment.bottom
+var builtinPos: BuiltinPosition? = nil
+var i = 1
+while i < args.count {
+    switch args[i] {
+    case "-h", "--help":
+        print("""
+        bildschirmuniversum — align and position built-in + external monitors and set refresh rate to 60 Hz
+
+        Usage:
+          bildschirmuniversum [options]
+
+        Options:
+          --align top|center|bottom      Vertical alignment when swapping (default: bottom).
+          --no-align                     Skip vertical alignment when swapping.
+          --builtin bottom|left|right    Reposition the built-in display relative to the
+                                         external group:
+                                           bottom  — centered below both external displays
+                                           left    — to the left, bottom-aligned
+                                           right   — to the right, bottom-aligned
+          --no-refresh                   Skip the automatic 60 Hz refresh-rate change.
+          --dry-run                      Preview changes without applying them.
+          -h, --help                     Show this help.
+        """)
+        exit(0)
+
+    case "--dry-run":    dryRun    = true
+    case "--no-align":   noAlign   = true
+    case "--no-refresh": noRefresh = true
+
+    case "--builtin":
+        i += 1
+        guard i < args.count, let p = BuiltinPosition(rawValue: args[i].lowercased()) else {
+            printError("--builtin requires: bottom, left, or right")
+            exit(1)
+        }
+        builtinPos = p
+
+    case "--align":
+        i += 1
+        guard i < args.count, let a = Alignment(rawValue: args[i].lowercased()) else {
+            printError("--align requires: top, center, or bottom")
+            exit(1)
+        }
+        alignment = a
+
+    default:
+        printError("Unknown argument: \(args[i]). Run with --help for usage.")
+        exit(1)
+    }
+    i += 1
+}
+
+if builtinPos != nil && noAlign {
+    printError("--builtin cannot be combined with --no-align.")
+    exit(1)
+}
+
+// MARK: - Discover displays
+
+var totalCount: UInt32 = 0
+CGGetActiveDisplayList(0, nil, &totalCount)
+var allIDs = [CGDirectDisplayID](repeating: 0, count: Int(totalCount))
+CGGetActiveDisplayList(totalCount, &allIDs, &totalCount)
+
+func makeDisplayInfo(_ id: CGDirectDisplayID) -> DisplayInfo {
+    let mode = CGDisplayCopyDisplayMode(id)
+    let hz   = mode.map { $0.refreshRate } ?? 0
+    return DisplayInfo(id: id, bounds: CGDisplayBounds(id), refreshRate: hz)
+}
+
+let externals: [DisplayInfo] = allIDs
+    .filter { CGDisplayIsBuiltin($0) == 0 }
+    .map(makeDisplayInfo)
+    .sorted { $0.bounds.origin.x < $1.bounds.origin.x }   // left → right
+
+let builtinDisplay: DisplayInfo? = allIDs
+    .filter { CGDisplayIsBuiltin($0) != 0 }
+    .map(makeDisplayInfo)
+    .first
+
+guard externals.count == 2 else {
+    printError("Expected exactly 2 external displays, found \(externals.count).")
+    switch externals.count {
+    case 0:  printError("No external monitors detected — are they connected?")
+    case 1:  printError("Only one external monitor detected — connect a second one.")
+    default: printError("More than 2 external monitors found — not supported.")
+    }
+    exit(1)
+}
+
+let left  = externals[0]
+let right = externals[1]
+
+print("Current arrangement:")
+print("  Left : \(left.label)")
+print("  Right: \(right.label)")
+if let b = builtinDisplay {
+    print("  Built-in: \(b.label)")
+} else if builtinPos != nil {
+    printWarn("--builtin specified but no active built-in display found (lid closed?).")
+}
+print()
+
+// MARK: - Refresh-rate analysis
+
+// Analyse both displays up front so dry-run can report what would happen.
+let leftRefresh  = noRefresh ? RefreshOutcome.alreadyAtTarget : findRefreshMode(for: left.id)
+let rightRefresh = noRefresh ? RefreshOutcome.alreadyAtTarget : findRefreshMode(for: right.id)
+
+func refreshSummary(_ outcome: RefreshOutcome, displayID: CGDirectDisplayID) -> String {
+    switch outcome {
+    case .alreadyAtTarget:            return "already at \(Int(targetHz)) Hz"
+    case .found:                      return "→ \(Int(targetHz)) Hz"
+    case .notAvailable(let r):        return "60 Hz unavailable (stays at \(Int(r)) Hz)"
+    case .unknownRate:                return "refresh rate unknown (skipped)"
+    }
+}
+
+if !noRefresh {
+    print("Refresh rate:")
+    print("  Left : \(refreshSummary(leftRefresh,  displayID: left.id))")
+    print("  Right: \(refreshSummary(rightRefresh, displayID: right.id))")
+    print()
+}
+
+// MARK: - Compute new origins
+
+let baseX = left.x
+let baseY = min(left.y, right.y)
+
+let maxH               = max(Int(left.height), Int(right.height))
+let externalTotalWidth = left.width + right.width
+let externalBottom: Int32 = baseY + Int32(maxH)
+
+// ── Swap + align ────────────────────────────────────────────────────────────
+// After swap: right.id → left slot, left.id → right slot.
+let swapLeftX:  Int32 = baseX
+let swapRightX: Int32 = baseX + right.width
+
+let swapLeftY:  Int32 = noAlign ? right.y
+    : alignment.yOrigin(displayHeight: Int(right.height), maxHeight: maxH, baseY: Int(baseY))
+let swapRightY: Int32 = noAlign ? left.y
+    : alignment.yOrigin(displayHeight: Int(left.height),  maxHeight: maxH, baseY: Int(baseY))
+
+// ── Built-in ────────────────────────────────────────────────────────────────
+// The built-in position is relative to the final external group, so it's the
+// same whether we swap or only align (total width and bottom edge are unchanged).
+let builtinOrigin: (x: Int32, y: Int32)? = builtinPos.flatMap { pos in
+    guard let b = builtinDisplay else { return nil }
+    return pos.origin(builtin: b, externalLeft: baseX,
+                      externalBottom: externalBottom,
+                      externalTotalWidth: externalTotalWidth)
+}
+
+// ── Dry run ─────────────────────────────────────────────────────────────────
+if dryRun {
+    if builtinPos != nil {
+        print("Would reposition built-in only (external displays unchanged):")
+    } else {
+        let desc = noAlign ? "swap (no alignment)" : "align \(alignment.rawValue) + swap"
+        print("Would \(desc):")
+        print("  Left : id=\(right.id)  origin=(\(swapLeftX), \(swapLeftY))")
+        print("  Right: id=\(left.id)  origin=(\(swapRightX), \(swapRightY))")
+    }
+    if let (bx, by) = builtinOrigin, let b = builtinDisplay {
+        print("  Built-in: id=\(b.id)  origin=(\(bx), \(by))  [\(builtinPos!.rawValue) of external group]")
+    }
+    print()
+    print("(dry-run — no changes applied)")
+    exit(0)
+}
+
+// MARK: - Apply configuration (single atomic transaction)
+
+var configRef: CGDisplayConfigRef?
+var err = CGBeginDisplayConfiguration(&configRef)
+guard err == .success, let cfg = configRef else {
+    printError("CGBeginDisplayConfiguration failed (code \(err.rawValue))")
+    exit(1)
+}
+
+// Queues a display-mode change (refresh rate) within the open config.
+func applyMode(refreshOutcome: RefreshOutcome, for displayID: CGDirectDisplayID) {
+    guard case .found(let mode) = refreshOutcome else { return }
+    CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
+}
+
+if builtinPos != nil {
+    // No swap: external displays keep their positions; only refresh rate is applied.
+    applyMode(refreshOutcome: leftRefresh,  for: left.id)
+    applyMode(refreshOutcome: rightRefresh, for: right.id)
+} else {
+    CGConfigureDisplayOrigin(cfg, right.id, swapLeftX,  swapLeftY)   // right → left slot
+    CGConfigureDisplayOrigin(cfg, left.id,  swapRightX, swapRightY)  // left  → right slot
+    applyMode(refreshOutcome: leftRefresh,  for: left.id)
+    applyMode(refreshOutcome: rightRefresh, for: right.id)
+}
+
+// Position the built-in display if requested.
+if let (bx, by) = builtinOrigin, let b = builtinDisplay {
+    CGConfigureDisplayOrigin(cfg, b.id, bx, by)
+}
+
+err = CGCompleteDisplayConfiguration(cfg, .forSession)
+if err == .success {
+    if builtinPos == nil {
+        let alignDesc = noAlign ? "" : " and aligned (\(alignment.rawValue))"
+        print("✓ Displays swapped\(alignDesc).")
+    }
+    if !noRefresh {
+        let needsChange = [leftRefresh, rightRefresh].contains {
+            if case .found = $0 { return true }; return false
+        }
+        if needsChange { print("✓ Refresh rate set to \(Int(targetHz)) Hz.") }
+    }
+    if builtinOrigin != nil {
+        print("✓ Built-in display positioned (\(builtinPos!.rawValue) of external group).")
+    }
+} else {
+    printError("CGCompleteDisplayConfiguration failed (code \(err.rawValue))")
+    CGCancelDisplayConfiguration(cfg)
+    exit(1)
+}
