@@ -9,16 +9,35 @@ import Foundation
 func printError(_ msg: String) { fputs("error: \(msg)\n", stderr) }
 func printWarn(_ msg: String)  { fputs("warning: \(msg)\n", stderr) }
 
-// MARK: - Private CoreGraphics rotation API
+// MARK: - Private CoreGraphics rotation API (dynamically resolved)
+//
+// CGSMainConnectionID and CGSSetDisplayRotation are private symbols that live
+// in the SkyLight framework (macOS 10.15+) or inside CoreGraphics on older
+// systems.  We resolve them at runtime with dlopen/dlsym so the script runs
+// correctly both when JIT-interpreted by `swift` and when compiled by `swiftc`.
 
-/// Returns the connection ID for the current process's CoreGraphics session.
-@_silgen_name("CGSMainConnectionID")
-func CGSMainConnectionID() -> Int32
+import Darwin
 
-/// Sets the rotation angle (0, 90, 180, or 270 degrees) for a display.
-/// Returns 0 on success.
-@_silgen_name("CGSSetDisplayRotation")
-func CGSSetDisplayRotation(_ conn: Int32, _ display: CGDirectDisplayID, _ degrees: Double) -> Int32
+private typealias CGSMainConnectionIDFn   = @convention(c) () -> Int32
+private typealias CGSSetDisplayRotationFn = @convention(c) (Int32, CGDirectDisplayID, Double) -> Int32
+
+/// Handle to the library that exports the private CGS rotation symbols.
+private let _cgsHandle: UnsafeMutableRawPointer? = {
+    // SkyLight is the home of the private CGS layer since macOS 10.15.
+    // Fall back to a plain RTLD_DEFAULT search so it also works on older systems
+    // or if the path ever changes.
+    let skyLight = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
+    return dlopen(skyLight, RTLD_LAZY | RTLD_LOCAL)
+        ?? dlopen(nil, RTLD_LAZY | RTLD_LOCAL)
+}()
+
+private func cgsSymbol<T>(_ name: String) -> T? {
+    guard let handle = _cgsHandle, let sym = dlsym(handle, name) else { return nil }
+    return unsafeBitCast(sym, to: T.self)
+}
+
+private let _cgsMainConnectionID:   CGSMainConnectionIDFn?   = cgsSymbol("CGSMainConnectionID")
+private let _cgsSetDisplayRotation: CGSSetDisplayRotationFn? = cgsSymbol("CGSSetDisplayRotation")
 
 // MARK: - Rotation
 
@@ -503,21 +522,28 @@ if err == .success {
 
     // Apply rotation changes (outside the atomic config transaction).
     // finalLeftID / finalRightID account for the swap performed above.
-    let conn = CGSMainConnectionID()
-    if let r = rotateLeft {
-        let result = CGSSetDisplayRotation(conn, finalLeftID, r.degrees)
-        if result == 0 {
-            print("✓ Left display rotated to \(Int(r.degrees))° (\(r.rawValue)).")
-        } else {
-            printError("Failed to rotate left display (code \(result)).")
+    if rotateLeft != nil || rotateRight != nil {
+        guard let connFn = _cgsMainConnectionID,
+              let rotFn  = _cgsSetDisplayRotation else {
+            printError("Display rotation API not available on this system.")
+            exit(1)
         }
-    }
-    if let r = rotateRight {
-        let result = CGSSetDisplayRotation(conn, finalRightID, r.degrees)
-        if result == 0 {
-            print("✓ Right display rotated to \(Int(r.degrees))° (\(r.rawValue)).")
-        } else {
-            printError("Failed to rotate right display (code \(result)).")
+        let conn = connFn()
+        if let r = rotateLeft {
+            let result = rotFn(conn, finalLeftID, r.degrees)
+            if result == 0 {
+                print("✓ Left display rotated to \(Int(r.degrees))° (\(r.rawValue)).")
+            } else {
+                printError("Failed to rotate left display (code \(result)).")
+            }
+        }
+        if let r = rotateRight {
+            let result = rotFn(conn, finalRightID, r.degrees)
+            if result == 0 {
+                print("✓ Right display rotated to \(Int(r.degrees))° (\(r.rawValue)).")
+            } else {
+                printError("Failed to rotate right display (code \(result)).")
+            }
         }
     }
 } else {
