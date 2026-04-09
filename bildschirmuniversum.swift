@@ -118,6 +118,7 @@ let args = CommandLine.arguments
 var dryRun      = false
 var noAlign     = false
 var noRefresh   = false
+var noUnmirror  = false
 var alignment   = Alignment.bottom
 var builtinPos: BuiltinPosition? = nil
 var i = 1
@@ -139,14 +140,16 @@ while i < args.count {
                                            left    — to the left, bottom-aligned
                                            right   — to the right, bottom-aligned
           --no-refresh                   Skip the automatic 60 Hz refresh-rate change.
+          --no-unmirror                  Skip automatic mirroring detection and removal.
           --dry-run                      Preview changes without applying them.
           -h, --help                     Show this help.
         """)
         exit(0)
 
-    case "--dry-run":    dryRun    = true
-    case "--no-align":   noAlign   = true
-    case "--no-refresh": noRefresh = true
+    case "--dry-run":      dryRun     = true
+    case "--no-align":     noAlign    = true
+    case "--no-refresh":   noRefresh   = true
+    case "--no-unmirror":  noUnmirror  = true
 
     case "--builtin":
         i += 1
@@ -189,15 +192,93 @@ func makeDisplayInfo(_ id: CGDirectDisplayID) -> DisplayInfo {
     return DisplayInfo(id: id, bounds: CGDisplayBounds(id), refreshRate: hz)
 }
 
-let externals: [DisplayInfo] = allIDs
+var externals: [DisplayInfo] = allIDs
     .filter { CGDisplayIsBuiltin($0) == 0 }
     .map(makeDisplayInfo)
     .sorted { $0.bounds.origin.x < $1.bounds.origin.x }   // left → right
 
-let builtinDisplay: DisplayInfo? = allIDs
+var builtinDisplay: DisplayInfo? = allIDs
     .filter { CGDisplayIsBuiltin($0) != 0 }
     .map(makeDisplayInfo)
     .first
+
+/// Returns the highest-resolution desktop-usable mode for `displayID`.
+/// Prefers the mode with the most pixels; among ties, picks the highest refresh rate.
+/// This is used to restore the native resolution after programmatic unmirroring,
+/// because macOS otherwise resets newly-independent displays to a low fallback (e.g. 800×600).
+func bestAvailableMode(for displayID: CGDirectDisplayID) -> CGDisplayMode? {
+    let opts = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+    guard let cf = CGDisplayCopyAllDisplayModes(displayID, opts),
+          let modes = cf as? [CGDisplayMode] else { return nil }
+    return modes
+        .filter { $0.isUsableForDesktopGUI() }
+        .max {
+            let pixA = $0.pixelWidth * $0.pixelHeight
+            let pixB = $1.pixelWidth * $1.pixelHeight
+            if pixA != pixB { return pixA < pixB }
+            return $0.refreshRate < $1.refreshRate
+        }
+}
+
+// MARK: - Disable mirroring if needed
+
+/// Returns IDs of online displays that are non-master members of a mirror set.
+func mirroredDisplayIDs() -> [CGDirectDisplayID] {
+    var onlineCount: UInt32 = 0
+    CGGetOnlineDisplayList(0, nil, &onlineCount)
+    var onlineIDs = [CGDirectDisplayID](repeating: 0, count: Int(onlineCount))
+    CGGetOnlineDisplayList(onlineCount, &onlineIDs, &onlineCount)
+    return onlineIDs.filter { id in
+        CGDisplayIsInMirrorSet(id) != 0 &&
+        CGDisplayMirrorsDisplay(id) != kCGNullDirectDisplay
+    }
+}
+
+if !noUnmirror && externals.count < 2 {
+    let mirrored = mirroredDisplayIDs()
+    if !mirrored.isEmpty {
+        print("Mirroring detected — \(mirrored.count) display(s) are mirrored.")
+        if dryRun {
+            print("(dry-run — would disable mirroring for display ID(s): \(mirrored.map(String.init).joined(separator: ", ")))")
+        } else {
+            var mirrorCfg: CGDisplayConfigRef?
+            let merr = CGBeginDisplayConfiguration(&mirrorCfg)
+            if merr == .success, let mcfg = mirrorCfg {
+                for id in mirrored {
+                    CGConfigureDisplayMirrorOfDisplay(mcfg, id, kCGNullDirectDisplay)
+                    // Restore native resolution in the same transaction;
+                    // otherwise macOS resets the display to a low fallback mode (e.g. 800×600).
+                    if let best = bestAvailableMode(for: id) {
+                        CGConfigureDisplayWithDisplayMode(mcfg, id, best, nil)
+                    }
+                }
+                if CGCompleteDisplayConfiguration(mcfg, .forSession) == .success {
+                    print("✓ Mirroring disabled.")
+                    Thread.sleep(forTimeInterval: 1.5)   // let the system settle
+                    // Re-discover active displays after unmirroring.
+                    var totalCount2: UInt32 = 0
+                    CGGetActiveDisplayList(0, nil, &totalCount2)
+                    var allIDs2 = [CGDirectDisplayID](repeating: 0, count: Int(totalCount2))
+                    CGGetActiveDisplayList(totalCount2, &allIDs2, &totalCount2)
+                    externals = allIDs2
+                        .filter { CGDisplayIsBuiltin($0) == 0 }
+                        .map(makeDisplayInfo)
+                        .sorted { $0.bounds.origin.x < $1.bounds.origin.x }
+                    builtinDisplay = allIDs2
+                        .filter { CGDisplayIsBuiltin($0) != 0 }
+                        .map(makeDisplayInfo)
+                        .first
+                } else {
+                    printWarn("Could not disable mirroring — proceeding with current display state.")
+                    CGCancelDisplayConfiguration(mirrorCfg!)
+                }
+            } else {
+                printWarn("CGBeginDisplayConfiguration failed while disabling mirroring (code \(merr.rawValue)) — skipping.")
+            }
+        }
+        print()
+    }
+}
 
 guard externals.count == 2 else {
     printError("Expected exactly 2 external displays, found \(externals.count).")
