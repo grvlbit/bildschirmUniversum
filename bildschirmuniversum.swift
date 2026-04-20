@@ -9,12 +9,95 @@ import Foundation
 func printError(_ msg: String) { fputs("error: \(msg)\n", stderr) }
 func printWarn(_ msg: String)  { fputs("warning: \(msg)\n", stderr) }
 
+// MARK: - Private CoreGraphics rotation API (dynamically resolved)
+//
+// The rotation API is private and has changed across macOS versions:
+//
+//   macOS 10.15 – 15:  CGSSetDisplayRotation(connection, displayID, degrees: Double) -> Int32
+//                      (requires a CGS connection obtained via CGSMainConnectionID)
+//   macOS 26+:         SLSSetDisplayRotation(displayID, degrees: Int32) -> Int32
+//                      (no connection argument; degrees are an integer)
+//
+// We resolve both at runtime with dlopen/dlsym and expose a single unified
+// closure so the rest of the script need not care about the difference.
+
+import Darwin
+
+private typealias CGSMainConnectionIDFn   = @convention(c) () -> Int32
+private typealias CGSSetDisplayRotationFn = @convention(c) (Int32, CGDirectDisplayID, Double) -> Int32
+private typealias SLSSetDisplayRotationFn = @convention(c) (CGDirectDisplayID, Int32) -> Int32
+
+/// Handle to the library that exports the private CGS/SLS rotation symbols.
+private let _cgsHandle: UnsafeMutableRawPointer? = {
+    // SkyLight is the home of the private CGS/SLS layer since macOS 10.15.
+    // Fall back to a plain RTLD_DEFAULT search so it also works on older systems
+    // or if the path ever changes.
+    let skyLight = "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight"
+    return dlopen(skyLight, RTLD_LAZY | RTLD_LOCAL)
+        ?? dlopen(nil, RTLD_LAZY | RTLD_LOCAL)
+}()
+
+private func cgsSymbol<T>(_ name: String) -> T? {
+    guard let handle = _cgsHandle, let sym = dlsym(handle, name) else { return nil }
+    return unsafeBitCast(sym, to: T.self)
+}
+
+/// Unified display-rotation setter: returns nil when neither API is available.
+/// Signature: (displayID, degrees) -> errorCode (0 = success)
+private let _setDisplayRotation: ((CGDirectDisplayID, Double) -> Int32)? = {
+    // macOS 26+: SLSSetDisplayRotation(displayID, Int32) -> Int32
+    if let fn: SLSSetDisplayRotationFn = cgsSymbol("SLSSetDisplayRotation") {
+        return { displayID, degrees in fn(displayID, Int32(degrees)) }
+    }
+    // macOS 10.15–25: CGSSetDisplayRotation(connection, displayID, Double) -> Int32
+    let connFn: CGSMainConnectionIDFn?   = cgsSymbol("CGSMainConnectionID")
+    let rotFn:  CGSSetDisplayRotationFn? = cgsSymbol("CGSSetDisplayRotation")
+    if let connFn, let rotFn {
+        return { displayID, degrees in rotFn(connFn(), displayID, degrees) }
+    }
+    return nil
+}()
+
+// MARK: - Rotation
+
+/// Rotation angle for an external display.
+///
+/// - `normal`     — 0°   (landscape, upright)
+/// - `left`       — 90°  (portrait, top of panel rotated counter-clockwise)
+/// - `upsideDown` — 180° (landscape, inverted)
+/// - `right`      — 270° (portrait, top of panel rotated clockwise)
+enum Rotation: String {
+    case normal, left, upsideDown, right
+
+    /// Case-insensitive initialiser so users can type any capitalisation.
+    /// Accepts both `upsideDown` and `upsidedown`.
+    init?(_ string: String) {
+        switch string.lowercased() {
+        case "normal":     self = .normal
+        case "left":       self = .left
+        case "upsidedown": self = .upsideDown
+        case "right":      self = .right
+        default:           return nil
+        }
+    }
+
+    var degrees: Double {
+        switch self {
+        case .normal:     return 0
+        case .left:       return 90
+        case .upsideDown: return 180
+        case .right:      return 270
+        }
+    }
+}
+
 // MARK: - Display model
 
 struct DisplayInfo {
     let id: CGDirectDisplayID
     let bounds: CGRect
     let refreshRate: Double     // Hz reported by the active mode (0 = unknown)
+    let rotation: Double        // current rotation in degrees (0, 90, 180, or 270)
 
     var x:      Int32 { Int32(bounds.origin.x) }
     var y:      Int32 { Int32(bounds.origin.y) }
@@ -25,9 +108,13 @@ struct DisplayInfo {
         refreshRate > 0 ? String(format: " @ %.0f Hz", refreshRate) : ""
     }
 
+    var rotationLabel: String {
+        rotation != 0 ? String(format: " rotation=%.0f°", rotation) : ""
+    }
+
     var label: String {
         "id=\(id)  origin=(\(x), \(y))  "
-        + "size=\(Int(bounds.width))×\(Int(bounds.height))\(rateLabel)"
+        + "size=\(Int(bounds.width))×\(Int(bounds.height))\(rateLabel)\(rotationLabel)"
     }
 }
 
@@ -121,6 +208,8 @@ var noRefresh   = false
 var noUnmirror  = false
 var alignment   = Alignment.bottom
 var builtinPos: BuiltinPosition? = nil
+var rotateLeft:  Rotation? = nil   // desired rotation for the display ending in the left slot
+var rotateRight: Rotation? = nil   // desired rotation for the display ending in the right slot
 var i = 1
 while i < args.count {
     switch args[i] {
@@ -139,6 +228,13 @@ while i < args.count {
                                            bottom  — centered below both external displays
                                            left    — to the left, bottom-aligned
                                            right   — to the right, bottom-aligned
+          --rotate-left  normal|left|upsideDown|right
+                                         Rotation for the display that ends up in the left
+                                         slot: normal (0°), left (90° CCW), upsideDown (180°),
+                                         right (270° CW).
+          --rotate-right normal|left|upsideDown|right
+                                         Rotation for the display that ends up in the right
+                                         slot (same values as --rotate-left).
           --no-refresh                   Skip the automatic 60 Hz refresh-rate change.
           --no-unmirror                  Skip automatic mirroring detection and removal.
           --dry-run                      Preview changes without applying them.
@@ -167,6 +263,22 @@ while i < args.count {
         }
         alignment = a
 
+    case "--rotate-left":
+        i += 1
+        guard i < args.count, let r = Rotation(args[i]) else {
+            printError("--rotate-left requires: normal, left, upsideDown, or right")
+            exit(1)
+        }
+        rotateLeft = r
+
+    case "--rotate-right":
+        i += 1
+        guard i < args.count, let r = Rotation(args[i]) else {
+            printError("--rotate-right requires: normal, left, upsideDown, or right")
+            exit(1)
+        }
+        rotateRight = r
+
     default:
         printError("Unknown argument: \(args[i]). Run with --help for usage.")
         exit(1)
@@ -189,7 +301,8 @@ CGGetActiveDisplayList(totalCount, &allIDs, &totalCount)
 func makeDisplayInfo(_ id: CGDirectDisplayID) -> DisplayInfo {
     let mode = CGDisplayCopyDisplayMode(id)
     let hz   = mode.map { $0.refreshRate } ?? 0
-    return DisplayInfo(id: id, bounds: CGDisplayBounds(id), refreshRate: hz)
+    let rot  = CGDisplayRotation(id)
+    return DisplayInfo(id: id, bounds: CGDisplayBounds(id), refreshRate: hz, rotation: rot)
 }
 
 var externals: [DisplayInfo] = allIDs
@@ -354,9 +467,21 @@ let builtinOrigin: (x: Int32, y: Int32)? = builtinPos.flatMap { pos in
                       externalTotalWidth: externalTotalWidth)
 }
 
+// ── Swap flag ────────────────────────────────────────────────────────────────
+// The swap is skipped when --builtin is given (external displays stay put) or
+// when any --rotate-* flag is used (rotation-only mode, no positional change).
+let doSwap = builtinPos == nil && rotateLeft == nil && rotateRight == nil
+
 // ── Dry run ─────────────────────────────────────────────────────────────────
+// After a swap: right.id ends up in the left slot, left.id in the right slot.
+// Without a swap: displays stay in place.
+let finalLeftID  = doSwap ? right.id : left.id
+let finalRightID = doSwap ? left.id  : right.id
+
 if dryRun {
-    if builtinPos != nil {
+    if !doSwap && builtinPos == nil {
+        print("Would rotate only (external displays stay in place):")
+    } else if builtinPos != nil {
         print("Would reposition built-in only (external displays unchanged):")
     } else {
         let desc = noAlign ? "swap (no alignment)" : "align \(alignment.rawValue) + swap"
@@ -367,6 +492,8 @@ if dryRun {
     if let (bx, by) = builtinOrigin, let b = builtinDisplay {
         print("  Built-in: id=\(b.id)  origin=(\(bx), \(by))  [\(builtinPos!.rawValue) of external group]")
     }
+    if let r = rotateLeft  { print("  Rotate left slot:  id=\(finalLeftID)  → \(Int(r.degrees))° (\(r.rawValue))") }
+    if let r = rotateRight { print("  Rotate right slot: id=\(finalRightID) → \(Int(r.degrees))° (\(r.rawValue))") }
     print()
     print("(dry-run — no changes applied)")
     exit(0)
@@ -387,13 +514,12 @@ func applyMode(refreshOutcome: RefreshOutcome, for displayID: CGDirectDisplayID)
     CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
 }
 
-if builtinPos != nil {
-    // No swap: external displays keep their positions; only refresh rate is applied.
+if doSwap {
+    CGConfigureDisplayOrigin(cfg, right.id, swapLeftX,  swapLeftY)   // right → left slot
+    CGConfigureDisplayOrigin(cfg, left.id,  swapRightX, swapRightY)  // left  → right slot
     applyMode(refreshOutcome: leftRefresh,  for: left.id)
     applyMode(refreshOutcome: rightRefresh, for: right.id)
 } else {
-    CGConfigureDisplayOrigin(cfg, right.id, swapLeftX,  swapLeftY)   // right → left slot
-    CGConfigureDisplayOrigin(cfg, left.id,  swapRightX, swapRightY)  // left  → right slot
     applyMode(refreshOutcome: leftRefresh,  for: left.id)
     applyMode(refreshOutcome: rightRefresh, for: right.id)
 }
@@ -405,7 +531,7 @@ if let (bx, by) = builtinOrigin, let b = builtinDisplay {
 
 err = CGCompleteDisplayConfiguration(cfg, .forSession)
 if err == .success {
-    if builtinPos == nil {
+    if doSwap {
         let alignDesc = noAlign ? "" : " and aligned (\(alignment.rawValue))"
         print("✓ Displays swapped\(alignDesc).")
     }
@@ -417,6 +543,33 @@ if err == .success {
     }
     if builtinOrigin != nil {
         print("✓ Built-in display positioned (\(builtinPos!.rawValue) of external group).")
+    }
+
+    // Apply rotation changes (outside the atomic config transaction).
+    // Rotation flags suppress the swap, so finalLeftID = left.id and
+    // finalRightID = right.id — each flag targets exactly the display
+    // currently in that slot.
+    if rotateLeft != nil || rotateRight != nil {
+        guard let rotFn = _setDisplayRotation else {
+            printError("Display rotation API not available on this system.")
+            exit(1)
+        }
+        if let r = rotateLeft {
+            let result = rotFn(finalLeftID, r.degrees)
+            if result == 0 {
+                print("✓ Left display rotated to \(Int(r.degrees))° (\(r.rawValue)).")
+            } else {
+                printError("Failed to rotate left display (code \(result)).")
+            }
+        }
+        if let r = rotateRight {
+            let result = rotFn(finalRightID, r.degrees)
+            if result == 0 {
+                print("✓ Right display rotated to \(Int(r.degrees))° (\(r.rawValue)).")
+            } else {
+                printError("Failed to rotate right display (code \(result)).")
+            }
+        }
     }
 } else {
     printError("CGCompleteDisplayConfiguration failed (code \(err.rawValue))")

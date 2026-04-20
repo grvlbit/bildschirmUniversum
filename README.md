@@ -44,6 +44,8 @@ swift bildschirmuniversum.swift
 | `--align top\|center\|bottom` | Vertical alignment when swapping (default: `bottom`) |
 | `--no-align` | Skip vertical alignment when swapping |
 | `--builtin bottom\|left\|right` | Reposition the built-in display relative to the external group. **External displays are left unchanged** when this flag is used |
+| `--rotate-left normal\|left\|upsideDown\|right` | Set rotation for the display that ends up in the **left** slot |
+| `--rotate-right normal\|left\|upsideDown\|right` | Set rotation for the display that ends up in the **right** slot |
 | `--no-refresh` | Skip the automatic 60 Hz refresh-rate change |
 | `-h`, `--help` | Show usage information |
 
@@ -51,6 +53,12 @@ The `--builtin` positions:
 - `bottom` — centered horizontally below both external displays
 - `left` — to the left of the external group, bottom-aligned
 - `right` — to the right of the external group, bottom-aligned
+
+The `--rotate-left` / `--rotate-right` rotation values:
+- `normal` — 0° (landscape, upright)
+- `left` — 90° counter-clockwise (portrait, top of panel faces left)
+- `upsideDown` — 180° (landscape, inverted)
+- `right` — 270° clockwise (portrait, top of panel faces right)
 
 If the laptop lid is closed (clamshell mode) and `--builtin` is specified,
 a warning is printed and the flag is silently ignored.
@@ -61,6 +69,8 @@ Uses macOS's `CoreGraphics` to apply all changes in **one atomic transaction**:
 - **Position swap** via `CGConfigureDisplayOrigin` — swaps screen-space origins
 - **Refresh rate** via `CGConfigureDisplayWithDisplayMode` — finds the best 60 Hz mode
   at the current resolution, preserving HiDPI (pixel dimensions are matched)
+- **Rotation** via the private `CGSSetDisplayRotation` API — applied immediately after
+  the main transaction; same mechanism used by macOS display management utilities
 
 Changes apply immediately and persist for the current login session.
 Running the command again restores the original order.
