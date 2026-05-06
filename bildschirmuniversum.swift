@@ -4,6 +4,11 @@
 import CoreGraphics
 import Foundation
 
+// Constants
+struct Constants {
+  static let marketingVersion = "0.2.0"
+}
+
 // MARK: - Helpers
 
 func printError(_ msg: String) { fputs("error: \(msg)\n", stderr) }
@@ -240,6 +245,10 @@ while i < args.count {
           --dry-run                      Preview changes without applying them.
           -h, --help                     Show this help.
         """)
+        exit(0)
+
+    case "-V", "--version":
+        print("bildschirmuniversum version \(Constants.marketingVersion)")
         exit(0)
 
     case "--dry-run":      dryRun     = true
