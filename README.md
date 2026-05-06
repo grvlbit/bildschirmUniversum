@@ -2,6 +2,7 @@
 > This tool was created with the assistance of AI (GitHub Copilot).
 
 # bildschirmUniversum
+
 A utility to easily manage display arrangements in BüroUniversum.
 
 ## bildschirmuniversum — manage external monitor arrangement
@@ -48,13 +49,16 @@ swift bildschirmuniversum.swift
 | `--rotate-right normal\|left\|upsideDown\|right` | Set rotation for the display that ends up in the **right** slot |
 | `--no-refresh` | Skip the automatic 60 Hz refresh-rate change |
 | `-h`, `--help` | Show usage information |
+| `-V`, `--version` | Show version information |
 
 The `--builtin` positions:
+
 - `bottom` — centered horizontally below both external displays
 - `left` — to the left of the external group, bottom-aligned
 - `right` — to the right of the external group, bottom-aligned
 
 The `--rotate-left` / `--rotate-right` rotation values:
+
 - `normal` — 0° (landscape, upright)
 - `left` — 90° counter-clockwise (portrait, top of panel faces left)
 - `upsideDown` — 180° (landscape, inverted)
@@ -66,6 +70,7 @@ a warning is printed and the flag is silently ignored.
 ### How it works
 
 Uses macOS's `CoreGraphics` to apply all changes in **one atomic transaction**:
+
 - **Position swap** via `CGConfigureDisplayOrigin` — swaps screen-space origins
 - **Refresh rate** via `CGConfigureDisplayWithDisplayMode` — finds the best 60 Hz mode
   at the current resolution, preserving HiDPI (pixel dimensions are matched)
@@ -97,4 +102,3 @@ Releases are built automatically by GitHub Actions when a version tag is pushed.
    - Publish a GitHub release with the zip attached and auto-generated release notes
 
 The new release will be picked up automatically by `install.sh` the next time a user runs it.
-
