@@ -6,7 +6,7 @@ import Foundation
 
 // Constants
 struct Constants {
-  static let marketingVersion = "0.2.0"
+  static let marketingVersion = "0.2.1"
 }
 
 // MARK: - Helpers
@@ -466,6 +466,12 @@ let swapLeftY:  Int32 = noAlign ? right.y
 let swapRightY: Int32 = noAlign ? left.y
     : alignment.yOrigin(displayHeight: Int(left.height),  maxHeight: maxH, baseY: Int(baseY))
 
+// ── Align only (no swap) ────────────────────────────────────────────────────
+// Used when --builtin is given: externals keep their L/R slots but are
+// vertically aligned so their edges meet.
+let alignLeftY:  Int32 = alignment.yOrigin(displayHeight: Int(left.height),  maxHeight: maxH, baseY: Int(baseY))
+let alignRightY: Int32 = alignment.yOrigin(displayHeight: Int(right.height), maxHeight: maxH, baseY: Int(baseY))
+
 // ── Built-in ────────────────────────────────────────────────────────────────
 // The built-in position is relative to the final external group, so it's the
 // same whether we swap or only align (total width and bottom edge are unchanged).
@@ -476,10 +482,15 @@ let builtinOrigin: (x: Int32, y: Int32)? = builtinPos.flatMap { pos in
                       externalTotalWidth: externalTotalWidth)
 }
 
-// ── Swap flag ────────────────────────────────────────────────────────────────
-// The swap is skipped when --builtin is given (external displays stay put) or
-// when any --rotate-* flag is used (rotation-only mode, no positional change).
-let doSwap = builtinPos == nil && rotateLeft == nil && rotateRight == nil
+// ── Swap / align flags ───────────────────────────────────────────────────────
+// doSwap:  swap external displays (and align them).  Skipped when --builtin is
+//          given or any --rotate-* flag is used.
+// doAlign: align externals in place without swapping.  Applied when --builtin
+//          is given so the user can first get everything positioned correctly,
+//          then run without arguments to swap if the externals are in the
+//          wrong order.
+let doSwap  = builtinPos == nil && rotateLeft == nil && rotateRight == nil
+let doAlign = builtinPos != nil
 
 // ── Dry run ─────────────────────────────────────────────────────────────────
 // After a swap: right.id ends up in the left slot, left.id in the right slot.
@@ -491,7 +502,9 @@ if dryRun {
     if !doSwap && builtinPos == nil {
         print("Would rotate only (external displays stay in place):")
     } else if builtinPos != nil {
-        print("Would reposition built-in only (external displays unchanged):")
+        print("Would align externals (\(alignment.rawValue)) and reposition built-in:")
+        print("  Left : id=\(left.id)  origin=(\(baseX), \(alignLeftY))")
+        print("  Right: id=\(right.id)  origin=(\(baseX + left.width), \(alignRightY))")
     } else {
         let desc = noAlign ? "swap (no alignment)" : "align \(alignment.rawValue) + swap"
         print("Would \(desc):")
@@ -529,6 +542,10 @@ if doSwap {
     applyMode(refreshOutcome: leftRefresh,  for: left.id)
     applyMode(refreshOutcome: rightRefresh, for: right.id)
 } else {
+    if doAlign {
+        CGConfigureDisplayOrigin(cfg, left.id,  baseX,              alignLeftY)
+        CGConfigureDisplayOrigin(cfg, right.id, baseX + left.width, alignRightY)
+    }
     applyMode(refreshOutcome: leftRefresh,  for: left.id)
     applyMode(refreshOutcome: rightRefresh, for: right.id)
 }
@@ -551,6 +568,7 @@ if err == .success {
         if needsChange { print("✓ Refresh rate set to \(Int(targetHz)) Hz.") }
     }
     if builtinOrigin != nil {
+        print("✓ External displays aligned (\(alignment.rawValue)).")
         print("✓ Built-in display positioned (\(builtinPos!.rawValue) of external group).")
     }
 
