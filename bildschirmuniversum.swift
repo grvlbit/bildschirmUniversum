@@ -6,7 +6,7 @@ import Foundation
 
 // Constants
 struct Constants {
-  static let marketingVersion = "0.2.1"
+  static let marketingVersion = "0.3.0"
 }
 
 // MARK: - Helpers
@@ -141,6 +141,14 @@ enum Alignment: String {
     }
 }
 
+// MARK: - Main display target (menu bar)
+
+/// Which display should become the "main" screen (receives the menu bar).
+/// Slot names refer to the final arrangement after swap (if any).
+enum MainTarget: String {
+    case left, right, builtin
+}
+
 // MARK: - Built-in display position
 
 enum BuiltinPosition: String {
@@ -215,6 +223,7 @@ var alignment   = Alignment.bottom
 var builtinPos: BuiltinPosition? = nil
 var rotateLeft:  Rotation? = nil   // desired rotation for the display ending in the left slot
 var rotateRight: Rotation? = nil   // desired rotation for the display ending in the right slot
+var mainTarget: MainTarget? = nil  // display that should get the menu bar
 var i = 1
 while i < args.count {
     switch args[i] {
@@ -242,6 +251,9 @@ while i < args.count {
                                          slot (same values as --rotate-left).
           --no-refresh                   Skip the automatic 60 Hz refresh-rate change.
           --no-unmirror                  Skip automatic mirroring detection and removal.
+          --main left|right|builtin      Move the menu bar to the specified display.
+                                         Slot names refer to the final arrangement (after
+                                         swap if applicable). Applied after all other changes.
           --dry-run                      Preview changes without applying them.
           -h, --help                     Show this help.
         """)
@@ -287,6 +299,14 @@ while i < args.count {
             exit(1)
         }
         rotateRight = r
+
+    case "--main":
+        i += 1
+        guard i < args.count, let t = MainTarget(rawValue: args[i].lowercased()) else {
+            printError("--main requires: left, right, or builtin")
+            exit(1)
+        }
+        mainTarget = t
 
     default:
         printError("Unknown argument: \(args[i]). Run with --help for usage.")
@@ -498,24 +518,61 @@ let doAlign = builtinPos != nil
 let finalLeftID  = doSwap ? right.id : left.id
 let finalRightID = doSwap ? left.id  : right.id
 
+// ── Final origins (before main-display offset) ──────────────────────────────
+var finalLeftOrigin:  (x: Int32, y: Int32) = doSwap ? (swapLeftX, swapLeftY)   : (left.x, left.y)
+var finalRightOrigin: (x: Int32, y: Int32) = doSwap ? (swapRightX, swapRightY) : (right.x, right.y)
+var finalBuiltinOrigin: (x: Int32, y: Int32)? = builtinOrigin ?? builtinDisplay.map { ($0.x, $0.y) }
+
+// ── Main display (menu bar) offset ──────────────────────────────────────────
+// Moving the menu bar = making the target display's origin (0,0).
+// We shift ALL display origins by (-targetX, -targetY).
+if let target = mainTarget {
+    let targetOrigin: (x: Int32, y: Int32)
+    switch target {
+    case .left:
+        targetOrigin = finalLeftOrigin
+    case .right:
+        targetOrigin = finalRightOrigin
+    case .builtin:
+        if let b = finalBuiltinOrigin {
+            targetOrigin = b
+        } else {
+            printWarn("--main builtin specified but no active built-in display found (lid closed?). Ignoring.")
+            targetOrigin = (0, 0)  // no-op offset
+        }
+    }
+    let dx = -targetOrigin.x
+    let dy = -targetOrigin.y
+    if dx != 0 || dy != 0 {
+        finalLeftOrigin.x  += dx;  finalLeftOrigin.y  += dy
+        finalRightOrigin.x += dx;  finalRightOrigin.y += dy
+        if var bo = finalBuiltinOrigin {
+            bo.x += dx; bo.y += dy
+            finalBuiltinOrigin = bo
+        }
+    }
+}
+
 if dryRun {
-    if !doSwap && builtinPos == nil {
+    if !doSwap && builtinPos == nil && mainTarget == nil {
         print("Would rotate only (external displays stay in place):")
     } else if builtinPos != nil {
         print("Would align externals (\(alignment.rawValue)) and reposition built-in:")
         print("  Left : id=\(left.id)  origin=(\(baseX), \(alignLeftY))")
         print("  Right: id=\(right.id)  origin=(\(baseX + left.width), \(alignRightY))")
     } else {
-        let desc = noAlign ? "swap (no alignment)" : "align \(alignment.rawValue) + swap"
+        let desc = doSwap ? (noAlign ? "swap (no alignment)" : "align \(alignment.rawValue) + swap") : "reposition"
         print("Would \(desc):")
-        print("  Left : id=\(right.id)  origin=(\(swapLeftX), \(swapLeftY))")
-        print("  Right: id=\(left.id)  origin=(\(swapRightX), \(swapRightY))")
+        print("  Left : id=\(finalLeftID)  origin=(\(finalLeftOrigin.x), \(finalLeftOrigin.y))")
+        print("  Right: id=\(finalRightID)  origin=(\(finalRightOrigin.x), \(finalRightOrigin.y))")
     }
-    if let (bx, by) = builtinOrigin, let b = builtinDisplay {
-        print("  Built-in: id=\(b.id)  origin=(\(bx), \(by))  [\(builtinPos!.rawValue) of external group]")
+    if let bo = finalBuiltinOrigin, let b = builtinDisplay {
+        let posLabel = builtinPos.map { " [\($0.rawValue) of external group]" } ?? ""
+        print("  Built-in: id=\(b.id)  origin=(\(bo.x), \(bo.y))\(posLabel)")
     }
     if let r = rotateLeft  { print("  Rotate left slot:  id=\(finalLeftID)  → \(Int(r.degrees))° (\(r.rawValue))") }
     if let r = rotateRight { print("  Rotate right slot: id=\(finalRightID) → \(Int(r.degrees))° (\(r.rawValue))") }
+    if let t = mainTarget  { print("  Main display (menu bar): \(t.rawValue)") }
     print()
     print("(dry-run — no changes applied)")
     exit(0)
@@ -536,9 +593,9 @@ func applyMode(refreshOutcome: RefreshOutcome, for displayID: CGDirectDisplayID)
     CGConfigureDisplayWithDisplayMode(cfg, displayID, mode, nil)
 }
 
-if doSwap {
-    CGConfigureDisplayOrigin(cfg, right.id, swapLeftX,  swapLeftY)   // right → left slot
-    CGConfigureDisplayOrigin(cfg, left.id,  swapRightX, swapRightY)  // left  → right slot
+if doSwap || mainTarget != nil {
+    CGConfigureDisplayOrigin(cfg, finalLeftID,  finalLeftOrigin.x,  finalLeftOrigin.y)
+    CGConfigureDisplayOrigin(cfg, finalRightID, finalRightOrigin.x, finalRightOrigin.y)
     applyMode(refreshOutcome: leftRefresh,  for: left.id)
     applyMode(refreshOutcome: rightRefresh, for: right.id)
 } else {
@@ -550,9 +607,10 @@ if doSwap {
     applyMode(refreshOutcome: rightRefresh, for: right.id)
 }
 
-// Position the built-in display if requested.
-if let (bx, by) = builtinOrigin, let b = builtinDisplay {
-    CGConfigureDisplayOrigin(cfg, b.id, bx, by)
+// Position the built-in display if its origin changed.
+if let bo = finalBuiltinOrigin, let b = builtinDisplay,
+   (builtinPos != nil || mainTarget != nil) {
+    CGConfigureDisplayOrigin(cfg, b.id, bo.x, bo.y)
 }
 
 err = CGCompleteDisplayConfiguration(cfg, .forSession)
@@ -570,6 +628,9 @@ if err == .success {
     if builtinOrigin != nil {
         print("✓ External displays aligned (\(alignment.rawValue)).")
         print("✓ Built-in display positioned (\(builtinPos!.rawValue) of external group).")
+    }
+    if let t = mainTarget {
+        print("✓ Menu bar moved to \(t.rawValue) display.")
     }
 
     // Apply rotation changes (outside the atomic config transaction).

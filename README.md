@@ -47,6 +47,7 @@ swift bildschirmuniversum.swift
 | `--builtin bottom\|left\|right` | Reposition the built-in display relative to the external group. **External displays are left unchanged** when this flag is used |
 | `--rotate-left normal\|left\|upsideDown\|right` | Set rotation for the display that ends up in the **left** slot |
 | `--rotate-right normal\|left\|upsideDown\|right` | Set rotation for the display that ends up in the **right** slot |
+| `--main left\|right\|builtin` | Move the menu bar to the specified display (slot names refer to the final arrangement) |
 | `--no-refresh` | Skip the automatic 60 Hz refresh-rate change |
 | `-h`, `--help` | Show usage information |
 | `-V`, `--version` | Show version information |
@@ -64,8 +65,12 @@ The `--rotate-left` / `--rotate-right` rotation values:
 - `upsideDown` — 180° (landscape, inverted)
 - `right` — 270° clockwise (portrait, top of panel faces right)
 
-If the laptop lid is closed (clamshell mode) and `--builtin` is specified,
-a warning is printed and the flag is silently ignored.
+If the laptop lid is closed (clamshell mode) and `--builtin` or `--main builtin`
+is specified, a warning is printed and the flag is silently ignored.
+
+The `--main` flag moves the macOS menu bar to the specified display by shifting
+all display origins so the target ends up at coordinate `(0, 0)`. It is applied
+after all other positioning operations and can be combined with any other flag.
 
 ### How it works
 
