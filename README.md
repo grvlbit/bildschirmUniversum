@@ -15,7 +15,14 @@ desk environments where the physical monitor layout varies between desks.
 **Requirements:** macOS  
 **No administrator privileges required.**
 
-### Install from GitHub release (recommended)
+
+### Install with Brew
+
+```bash
+brew install id-unibe-ch/tap/bildschirmUniversum
+```
+
+### Install from GitHub release
 
 ```bash
 bash install.sh
